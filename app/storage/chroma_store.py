@@ -94,3 +94,27 @@ class ChromaVectorStore:
 
     def search(self, query_vector: list[float], top_k: int = None) -> list[Chunk]:
         return [chunk for _, chunk in self.search_with_scores(query_vector, top_k=top_k)]
+
+    def get_all_chunks(self) -> list[Chunk]:
+        """Every chunk currently stored, regardless of any query -- used to
+        build a BM25 keyword index, which needs the whole corpus up front
+        rather than being searched vector-by-vector like cosine similarity.
+        """
+        if self.collection.count() == 0:
+            return []
+
+        results = self.collection.get(include=["documents", "metadatas"])
+
+        return [
+            Chunk(
+                id=chunk_id,
+                document_id=metadata["document_id"],
+                chunk_index=metadata["chunk_index"],
+                text=text,
+                embedding=None,
+                metadata=json.loads(metadata.get("metadata_json", "{}")),
+            )
+            for chunk_id, text, metadata in zip(
+                results["ids"], results["documents"], results["metadatas"]
+            )
+        ]

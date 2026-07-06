@@ -41,7 +41,9 @@ docmind/
 │   │   ├── embedding_service.py  # Text -> vector (Gemini embeddings)
 │   │   └── vector_store.py       # In-memory store + cosine similarity search
 │   ├── retrieval/
-│   │   ├── retriever.py          # Question -> relevant Chunks (similarity threshold applied)
+│   │   ├── retriever.py          # Question -> relevant Chunks (dense/embedding, similarity threshold applied)
+│   │   ├── bm25_retriever.py     # Question -> relevant Chunks (keyword/BM25)
+│   │   ├── hybrid_retriever.py   # Merges dense + BM25 via Reciprocal Rank Fusion
 │   │   └── rag_service.py        # Question -> grounded answer + sources
 │   ├── storage/
 │   │   └── chroma_store.py       # Persistent, disk-backed vector store (same interface as in-memory)
@@ -51,6 +53,7 @@ docmind/
 │   ├── test_pipeline.py          # Manual test: ingest + embed a PDF (in-memory, throwaway)
 │   ├── test_search.py            # Manual test: ingest, then semantic search (in-memory)
 │   ├── test_rag.py               # Manual test: full RAG loop, in-memory store
+│   ├── test_hybrid.py            # Manual test: dense vs BM25 vs hybrid, side by side
 │   ├── ingest.py                 # Persist a PDF's embedded chunks into Chroma (run once per doc)
 │   └── ask.py                    # Ask a question against the persisted Chroma store (no re-embedding)
 ├── tests/
@@ -58,7 +61,9 @@ docmind/
 │   ├── test_embeddings.py        # Unit tests: EmbeddingService (Gemini API mocked)
 │   ├── test_vector_store.py      # Unit tests: cosine similarity, ranking, top_k
 │   ├── test_chroma_store.py      # Integration tests: ChromaVectorStore (real, on-disk, no mocks)
-│   └── test_retriever.py         # Unit tests: Retriever wiring + similarity threshold
+│   ├── test_retriever.py         # Unit tests: Retriever wiring + similarity threshold
+│   ├── test_bm25_retriever.py    # Unit tests: keyword matching, zero-overlap filtering
+│   └── test_hybrid_retriever.py  # Unit tests: Reciprocal Rank Fusion, fallback to BM25
 ├── docs/
 │   ├── architecture.md           # Component diagram, index-time vs query-time flow
 │   └── ingestion.md              # PDF -> chunk -> embedding pipeline, in depth
@@ -80,7 +85,7 @@ Each folder has exactly one job. This mirrors a pattern you'd recognize from mob
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install google-genai python-dotenv rich pymupdf chromadb
+pip install google-genai python-dotenv rich pymupdf chromadb rank-bm25
 ```
 
 Create a `.env` file in the project root:
@@ -124,6 +129,12 @@ python scripts/test_rag.py data/documents/your_file.pdf "your question here"
 ```bash
 python scripts/ingest.py data/documents/your_file.pdf   # run once per document
 python scripts/ask.py "your question here"               # run any time after
+```
+
+**Compare dense-only vs. keyword-only vs. hybrid retrieval for a question:**
+
+```bash
+python scripts/test_hybrid.py data/documents/your_file.pdf "your question here"
 ```
 
 ---
@@ -400,35 +411,76 @@ New scripts reflect the resulting two-step workflow: `scripts/ingest.py <pdf>` d
 
 ---
 
+## Part 5 — Hybrid retrieval: BM25 + dense search (`app/retrieval/bm25_retriever.py`, `hybrid_retriever.py`)
+
+Dense (embedding) search understands meaning but not always precise wording. Ask about "PyMuPDF" and an embedding model represents the *overall topic* of a chunk (PDF processing, say) rather than weighting an exact library name heavily — so a chunk that literally contains "PyMuPDF" might not be the top cosine-similarity match. BM25, classic keyword/term-frequency search, has the opposite strength and weakness: it finds exact terms reliably but has no idea that "car" and "automobile" mean the same thing. Combining both catches what either one misses alone.
+
+### `BM25Retriever`: the keyword half
+
+`BM25Retriever` (using the `rank-bm25` package's `BM25Okapi`) takes the *entire* chunk corpus up front, unlike `Retriever`, which searches a vector store per query — BM25 needs to see every document to compute how rare/informative each term is across the corpus (its "inverse document frequency"):
+
+```python
+def __init__(self, chunks: list[Chunk]):
+    self.chunks = chunks
+    self._index = BM25Okapi([_tokenize(chunk.text) for chunk in chunks]) if chunks else None
+```
+
+A subtlety worth calling out: `retrieve()` only returns chunks with a BM25 score strictly greater than zero. A score of exactly 0 means no term overlap at all — verified directly (`bm25.get_scores(...)` returns `0.0` for a chunk sharing no words with the query) — so this is BM25's own signal that a chunk isn't a match, not a weak one, and it's the keyword-search equivalent of `Retriever`'s similarity threshold: don't return your "best" match if it isn't actually related to the question.
+
+### Fusing two different scoring scales: Reciprocal Rank Fusion
+
+Dense scores (cosine similarity) live on a 0-1 scale; BM25 scores are unbounded and depend on the size and content of the corpus. A BM25 score of 4.2 says nothing about whether it's better or worse than a cosine similarity of 0.85 — they can't be averaged or compared directly. `hybrid_retriever.py` sidesteps this with **Reciprocal Rank Fusion (RRF)**, which ignores raw scores entirely and fuses based on *rank position* in each list instead:
+
+```python
+fused_score(chunk) = sum over each list it appears in of 1 / (k + rank)
+```
+
+A chunk ranked #1 by both dense and BM25 search clearly deserves to outrank one ranked #1 by only one of them — and that reasoning holds regardless of what scale either method's underlying scores are on. `k=60` is the standard smoothing constant from the original RRF paper, not something tuned for this project specifically.
+
+### `HybridRetriever`: each side contributes only what it's confident about
+
+```python
+dense_candidates = self.dense_retriever.retrieve(question, top_k=candidate_pool)   # threshold already applied
+bm25_candidates = [chunk for _, chunk in self.bm25_retriever.retrieve(question, top_k=candidate_pool)]  # zero-overlap already filtered
+
+if not dense_candidates and not bm25_candidates:
+    return []
+
+return _reciprocal_rank_fusion([dense_candidates, bm25_candidates])[:top_k]
+```
+
+This is deliberately built on top of `Retriever.retrieve()` and `BM25Retriever.retrieve()` as-is, not their raw unfiltered scores — each one already decides what it's confident about (the similarity threshold on one side, the zero-overlap filter on the other) before hybrid fusion ever sees the candidates. That preserves the "I don't know" guarantee from Part 4: if dense search found nothing above threshold *and* BM25 found no keyword overlap at all, `HybridRetriever` returns `[]`, same as a plain `Retriever` would. But if dense search comes back empty while BM25 finds an exact keyword match, hybrid retrieval surfaces it anyway — which is the actual point of building this in the first place, demonstrated directly in `tests/test_hybrid_retriever.py::test_hybrid_retriever_falls_back_to_bm25_when_dense_finds_nothing`.
+
+`HybridRetriever` exposes the same `retrieve(question, top_k) -> list[Chunk]` signature as `Retriever`, so it's a drop-in replacement anywhere a `Retriever` is used, including `RagService` — `RagService(HybridRetriever(dense, bm25))` instead of `RagService(Retriever(store))`, no changes needed to `RagService` itself.
+
+`scripts/test_hybrid.py` runs dense-only, BM25-only, and fused hybrid retrieval against the same question side by side, specifically so the difference is visible rather than theoretical.
+
+---
+
 ## What's next
 
-Per the roadmap this project is following, Version 1 (chat, ingestion, chunking, embeddings, semantic search, retrieval, RAG service, citations, "I don't know" fallback) is functionally complete. The remaining work is about **improving retrieval quality**, not making the system work in the first place:
+Per the roadmap this project is following, Version 1 (chat, ingestion, chunking, embeddings, semantic search, retrieval, RAG service, citations, "I don't know" fallback) is functionally complete, and Week 1-2 of the retrieval-quality roadmap (similarity threshold, persistence, hybrid search) is now done too. What's left is:
 
 ```
-Current                              Planned
+Current (done)                        Next
 
-Dense (embedding) search             BM25 keyword search
-      │                                    +
-      ▼                              Dense (embedding) search
-    LLM                                    │
-                                            ▼
-                                        Merge results
-                                            │
-                                            ▼
-                                   Cross-Encoder Reranker
-                                            │
-                                            ▼
-                                           LLM
+Dense + BM25 (RRF-fused)               Dense + BM25 (RRF-fused)
+      │                                      │
+      ▼                                      ▼
+     LLM                            Cross-Encoder Reranker
+                                             │
+                                             ▼
+                                            LLM
 ```
 
-This is **hybrid retrieval**: dense (embedding) search is good at matching meaning but can miss exact keywords/names/codes that BM25 (classic keyword search) catches reliably; combining both and reranking the merged results is one of the highest-leverage improvements to retrieval quality in a real RAG system.
+A cross-encoder reranker is a different kind of model from the embedding model used so far: instead of encoding the question and each chunk *separately* into vectors and comparing them (what both dense search and, in spirit, BM25 do), a cross-encoder reads the question and a candidate chunk *together* in a single pass and directly predicts a relevance score. That's slower per-pair (you can't precompute anything, unlike embeddings), which is exactly why it's used to re-score a modest top-20-or-so candidate set from hybrid retrieval rather than the entire corpus — precision over the shortlist, not search over everything.
 
-Concretely, still open: adding BM25 and merging it with dense search, a cross-encoder reranker, richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3", an evaluation harness (RAGAS/DeepEval or a hand-built `evaluation/dataset.json` of question → expected-answer pairs) to measure retrieval and answer quality objectively rather than by eyeballing outputs, wiring `RagService` into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts, applying the existing `SYSTEM_PROMPT` to the chat session, and eventually a FastAPI service + Docker packaging.
+Concretely, still open: a cross-encoder reranker over hybrid retrieval's output, richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3", an evaluation harness (RAGAS/DeepEval or a hand-built `evaluation/dataset.json` of question → expected-answer pairs) to measure retrieval and answer quality objectively rather than by eyeballing outputs, wiring `RagService`/`HybridRetriever` into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts, applying the existing `SYSTEM_PROMPT` to the chat session, and eventually a FastAPI service + Docker packaging.
 
-Done, as of this update: the similarity threshold (Part 4, above) — the highest-priority item on the retrieval-quality list, since a retriever that can say "I don't know" is the foundation everything else (hybrid search, reranking, evaluation) builds on — and swapping `InMemoryVectorStore` for a persistent `ChromaVectorStore`, so embeddings survive a restart instead of being recomputed every run.
+Done, as of this update: the similarity threshold (Part 4) — the highest-priority item on the retrieval-quality list, since a retriever that can say "I don't know" is the foundation everything else builds on; swapping `InMemoryVectorStore` for a persistent `ChromaVectorStore` (Part 4), so embeddings survive a restart instead of being recomputed every run; and hybrid retrieval (Part 5) combining dense and keyword search via Reciprocal Rank Fusion.
 
 ---
 
 ## Concepts this project demonstrates
 
-For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, a similarity threshold as the mechanism that lets a retriever say "I don't know" instead of always returning its best-available guess, designing an interface (`add`/`search`/`search_with_scores`) so a storage backend can be swapped from an in-memory list to a persistent database without touching any calling code, deterministic ID generation as a prerequisite for idempotent upserts, the precision/recall gap that motivates hybrid search and reranking, and a layered architecture (client / service / model / retrieval / storage / UI) that keeps each concern independently testable and replaceable.
+For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, a similarity threshold as the mechanism that lets a retriever say "I don't know" instead of always returning its best-available guess, designing an interface (`add`/`search`/`search_with_scores`) so a storage backend can be swapped from an in-memory list to a persistent database without touching any calling code, deterministic ID generation as a prerequisite for idempotent upserts, dense vs. keyword (BM25) search as complementary rather than competing signals, Reciprocal Rank Fusion as a way to merge rankings from incomparable scoring scales without normalizing either one, and a layered architecture (client / service / model / retrieval / storage / UI) that keeps each concern independently testable and replaceable.

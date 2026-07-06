@@ -34,6 +34,13 @@ class InMemoryVectorStore:
     def add(self, chunks: list[Chunk]) -> None:
         self.chunks.extend(chunks)
 
+    def get_all_chunks(self) -> list[Chunk]:
+        """Every chunk currently stored, regardless of any query -- used to
+        build a BM25 keyword index, which needs the whole corpus up front
+        rather than being searched vector-by-vector like cosine similarity.
+        """
+        return list(self.chunks)
+
     def _ranked(self, query_vector: list[float]) -> list[tuple[float, Chunk]]:
         """Every stored chunk, scored against the query and sorted best-first.
         Shared by search() and search_with_scores() so there's one place

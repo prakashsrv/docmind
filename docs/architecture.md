@@ -49,6 +49,29 @@ Plain-text version, for anywhere Mermaid isn't rendered:
 
 Note that `complete()` is a plain function in `chat_service.py`, not a method on the `ChatService` class used by the interactive terminal chat (`main.py`). They deliberately don't share state: `ChatService` keeps a running multi-turn conversation via `client.chats.create(...)`, while `complete()` is a one-shot, stateless call — a RAG prompt already carries its full context on every call, so it shouldn't also accumulate into a growing chat history.
 
+"Retriever" in the diagram above is really "whatever `RagService` was constructed with that implements `retrieve(question, top_k) -> list[Chunk]`" — that's a plain `Retriever` (dense/embedding search only) or a `HybridRetriever` (dense + BM25 fused), interchangeably. See below for how the latter works internally.
+
+## Hybrid retrieval: inside `HybridRetriever`
+
+```mermaid
+flowchart TD
+    Question([Question])
+    Dense["Retriever.retrieve()<br/>(embedding search, threshold-filtered)"]
+    BM25["BM25Retriever.retrieve()<br/>(keyword search, zero-overlap filtered)"]
+    RRF["_reciprocal_rank_fusion()"]
+    Result([Fused, ranked Chunks])
+
+    Question --> Dense
+    Question --> BM25
+    Dense --> RRF
+    BM25 --> RRF
+    RRF --> Result
+```
+
+Both branches run independently and each applies its own relevance gate before fusion ever sees the candidates: `Retriever` drops anything below `SIMILARITY_THRESHOLD`, `BM25Retriever` drops anything with zero term overlap. Reciprocal Rank Fusion then merges the two (already-filtered) ranked lists by rank position, not raw score, since cosine similarity (0-1) and BM25 (unbounded, corpus-dependent) aren't on comparable scales. If both branches come back empty, `HybridRetriever` returns `[]` too — the "I don't know" guarantee from the similarity-threshold section holds for hybrid retrieval as well, it just now requires *both* signals to be silent rather than one.
+
+This is also precisely the scenario hybrid retrieval was built for: a query like an exact library name might clear BM25's zero-overlap filter easily while failing dense search's similarity threshold (embeddings represent overall meaning, not exact strings) — in that case `Dense` contributes nothing, `BM25` contributes the match, and the fused result surfaces it anyway. `tests/test_hybrid_retriever.py::test_hybrid_retriever_falls_back_to_bm25_when_dense_finds_nothing` tests exactly this.
+
 ## Index-time flow: ingesting a document
 
 ```mermaid
@@ -115,7 +138,8 @@ Before this, vector search always returned *something* — the top-k least-bad m
 
 ## Current limitations (see `README.md` → "What's next")
 
-- The two flows above aren't connected to `main.py`'s interactive chat loop yet — there's no single running application, only test scripts / `ingest.py` + `ask.py` that exercise the full pipeline.
-- Retrieval is dense (embedding) search only; no keyword (BM25) matching or reranking yet, so a query can still fail to surface a chunk that a plain keyword match would have caught (e.g. an exact library name like "PyMuPDF").
+- The flows above aren't connected to `main.py`'s interactive chat loop yet — there's no single running application, only test scripts / `ingest.py` + `ask.py` that exercise the full pipeline.
+- No reranking yet: hybrid retrieval (dense + BM25, RRF-fused) improves the candidate set, but nothing re-scores question+chunk pairs together the way a cross-encoder would — see README's "What's next" for what that adds.
+- `BM25Retriever` rebuilds its keyword index from scratch on construction (`BM25Okapi([...])` over the whole corpus) — fine for the corpus sizes here, but unlike `ChromaVectorStore` it has no persistence of its own yet.
 - The similarity threshold is a single global constant, not calibrated against real usage data — see the section above.
 - `ChromaVectorStore.search()` doesn't return the chunk's embedding vector (Chroma isn't asked for it back, since nothing downstream needs it) — a real difference from `InMemoryVectorStore`, which happens to return the original in-memory object with its embedding intact. Don't rely on `chunk.embedding` being populated after any search.
