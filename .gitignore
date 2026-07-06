@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+.pytest_cache/
 
 # Ingestion source documents (personal / copyrighted, don't commit)
 data/documents/*

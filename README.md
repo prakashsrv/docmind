@@ -2,18 +2,20 @@
 
 DocMind is a terminal-based AI assistant built from scratch, in phases, as a way to learn how a real Retrieval-Augmented Generation (RAG) system is put together — not by installing a framework, but by building each piece: an LLM client, a chat service, a PDF ingestion pipeline, and a semantic search engine.
 
-This document explains both **what was built** and **why it works the way it does**, so it can be read as a project write-up or as a study guide for the concepts involved.
+This document explains both **what was built** and **why it works the way it does**, so it can be read as a project write-up or as a study guide for the concepts involved. For deeper dives, see [`docs/architecture.md`](docs/architecture.md) (component diagram, index-time vs. query-time flows) and [`docs/ingestion.md`](docs/ingestion.md) (the PDF → chunk → embedding pipeline in detail).
 
 ---
 
 ## What DocMind does today
 
-Right now, DocMind is two things living in the same codebase:
+DocMind is now a working Retrieval-Augmented Generation (RAG) system, built up in four phases:
 
 1. A streaming, multi-turn terminal chatbot backed by Google's Gemini API.
-2. A standalone document-ingestion and semantic-search pipeline: PDF → text → chunks → embeddings → an in-memory vector store you can query by meaning, not keywords.
+2. A document-ingestion pipeline: PDF → text → overlapping chunks.
+3. A semantic search layer: chunks → embeddings → an in-memory vector store you can query by meaning, not keywords.
+4. A retrieval-augmented answer layer: question → relevant chunks → a grounded, cited answer from Gemini — instead of an answer from the model's training data alone.
 
-These two halves aren't wired together yet — that's the next phase (feeding search results into the chatbot as context, which is what turns a chatbot into "RAG"). Everything below reflects what's actually implemented.
+Phases 1-3 and Phase 4 are still two separate entry points in the code (the interactive chatbot in `main.py` doesn't call into retrieval yet), but the full pipeline — PDF in, grounded answer with citations out — works end to end via `scripts/test_rag.py`. Everything below reflects what's actually implemented.
 
 ---
 
@@ -38,13 +40,26 @@ docmind/
 │   ├── embedding/
 │   │   ├── embedding_service.py  # Text -> vector (Gemini embeddings)
 │   │   └── vector_store.py       # In-memory store + cosine similarity search
+│   ├── retrieval/
+│   │   ├── retriever.py          # Question -> relevant Chunks
+│   │   └── rag_service.py        # Question -> grounded answer + sources
 │   └── ui/
 │       └── console.py            # Rich-based terminal rendering
 ├── scripts/
 │   ├── test_pipeline.py          # Manual test: ingest + embed a PDF
-│   └── test_search.py            # Manual test: ingest, then semantic search
+│   ├── test_search.py            # Manual test: ingest, then semantic search
+│   └── test_rag.py               # Manual test: full RAG loop, question -> cited answer
+├── tests/
+│   ├── test_chunker.py           # Unit tests: chunking + overlap math
+│   ├── test_embeddings.py        # Unit tests: EmbeddingService (Gemini API mocked)
+│   └── test_retriever.py         # Unit tests: Retriever wiring (deps mocked)
+├── docs/
+│   ├── architecture.md           # Component diagram, index-time vs query-time flow
+│   └── ingestion.md              # PDF -> chunk -> embedding pipeline, in depth
+├── screenshots/                  # Terminal screenshots for reviewers (see screenshots/README.md)
 ├── data/
 │   └── documents/                # Source PDFs (gitignored, except .gitkeep)
+├── conftest.py                   # Puts the project root on sys.path for pytest
 ├── main.py                       # Entry point for the interactive chatbot
 └── .env                          # GEMINI_API_KEY (gitignored)
 ```
@@ -90,6 +105,25 @@ python scripts/test_pipeline.py data/documents/your_file.pdf
 ```bash
 python scripts/test_search.py data/documents/your_file.pdf "your query here"
 ```
+
+**Ask a grounded, cited question over a PDF (full RAG):**
+
+```bash
+python scripts/test_rag.py data/documents/your_file.pdf "your question here"
+```
+
+---
+
+## Tests
+
+Unit tests cover the pieces that don't need a live API call to verify — chunking math and `Retriever`/`EmbeddingService` wiring, with Gemini calls mocked out via `unittest.mock`. They run offline and don't touch your `.env` or API quota.
+
+```bash
+pip install pytest
+pytest
+```
+
+The `scripts/test_*.py` files are a different thing: manual, end-to-end smoke tests that do call the real Gemini API against a real PDF, meant to be run by hand while developing rather than as part of an automated test suite.
 
 ---
 
@@ -242,33 +276,101 @@ PDF → load_pdf_text() → Document → chunk_document() → Chunks
 
 ---
 
+## Part 3 — Retrieval-Augmented Generation (`app/retrieval/`)
+
+This is the phase that turns "a chatbot" plus "a search demo" into an actual RAG system: the model's answer is now grounded in retrieved evidence instead of only its training data.
+
+```
+User Question
+      │
+      ▼
+   Retriever            (embed question, search the vector store)
+      │
+ Top-k Chunks
+      │
+      ▼
+ Prompt Builder          (build_rag_prompt: label chunks, add instructions)
+      │
+      ▼
+  Gemini LLM             (complete: stateless, one-shot)
+      │
+      ▼
+Grounded Answer + Sources
+```
+
+### The Retriever never talks to Gemini
+
+`Retriever.retrieve(question, top_k)` does exactly two things: embed the question with `EmbeddingService`, then search an `InMemoryVectorStore` for the closest chunks. It has no idea an LLM exists. This separation means the retrieval step — the part most likely to get swapped out later for hybrid search or reranking — can change without touching how answers are generated, and can be tested/reasoned about in isolation.
+
+### Building a prompt that forces grounding
+
+Instead of sending the question straight to Gemini, `build_rag_prompt()` (in `app/llm/prompts.py`) wraps it with the retrieved chunks and explicit instructions:
+
+```python
+RAG_PROMPT_TEMPLATE = """You are DocMind.
+
+Answer the question using ONLY the context below. Do not use outside
+knowledge, and do not invent facts that aren't in the context.
+
+If the answer is not present in the context, respond with exactly this
+sentence and nothing else:
+"{not_found}"
+
+Context:
+{context}
+...
+```
+
+Each chunk is labeled `[Chunk N]` in the context block, which is what lets both the model and the code refer back to *which* piece of evidence an answer came from.
+
+### `RagService`: stateless by design
+
+`RagService.answer(question)` chains `Retriever` → `build_rag_prompt` → a new `complete(prompt)` function in `chat_service.py`. `complete()` is deliberately a **one-shot, stateless** call (`client.models.generate_content`), not the multi-turn `chat.send_message()` used by the interactive chatbot — a RAG prompt already carries its full context every time, so it shouldn't also accumulate into a growing conversation history the way a normal chat turn does.
+
+### Citations that can't be hallucinated
+
+The tempting approach is to just ask the model to cite its sources in the answer text and trust it. Instead, `RagService` attaches sources **deterministically**, from the chunks it actually retrieved and sent to Gemini — not from what the model claims it used:
+
+```python
+sources = ", ".join(f"Chunk {chunk.chunk_index}" for chunk in chunks)
+return f"{answer}\n\nSources: {sources}"
+```
+
+The model can still get the *answer* wrong, but it can't fabricate a citation to a chunk that was never in its prompt — the set of possible citations is constrained by code, not by the model's honesty.
+
+### The "I don't know" fallback, and its current limitation
+
+`NOT_FOUND_MESSAGE` is a single constant shared between the prompt (which tells Gemini to return it verbatim when the answer isn't in the context) and `RagService` (which checks for it to decide whether attaching "Sources:" even makes sense). Worth being honest about a real gap here: cosine similarity search always returns *something* — the top-k least-bad matches — even for a question with no relevant content in the document at all, like "who won the World Cup" against a document about RAG architecture. There's no similarity-score threshold filtering out weak matches before they reach the prompt, so today the fallback relies entirely on the model following instructions rather than on retrieval refusing to return irrelevant chunks. That's precisely the gap that reranking and score thresholds (below) are meant to close.
+
+---
+
 ## What's next
 
-The two halves described above — the chatbot and the search pipeline — aren't connected yet. The next phase is exactly that connection, which is what actually makes this a RAG system rather than "a chatbot" and "a search demo" sitting side by side:
+Per the roadmap this project is following, Version 1 (chat, ingestion, chunking, embeddings, semantic search, retrieval, RAG service, citations, "I don't know" fallback) is functionally complete. The remaining work is about **improving retrieval quality**, not making the system work in the first place:
 
 ```
-User question
-      │
-      ▼
-EmbeddingService.embed(question)
-      │
-      ▼
-VectorStore.search(query_vector)
-      │
-      ▼
-Top-k relevant chunks
-      │
-      ▼
-Inject chunks into the prompt sent to ChatService
-      │
-      ▼
-Gemini answers using retrieved context, not just training data
+Current                              Planned
+
+Dense (embedding) search             BM25 keyword search
+      │                                    +
+      ▼                              Dense (embedding) search
+    LLM                                    │
+                                            ▼
+                                        Merge results
+                                            │
+                                            ▼
+                                   Cross-Encoder Reranker
+                                            │
+                                            ▼
+                                           LLM
 ```
 
-Beyond that, planned directions include replacing `InMemoryVectorStore` with a persistent vector database (Chroma), applying the `SYSTEM_PROMPT` already defined in `prompts.py` to the chat session (currently written but not yet wired in), and evaluating chunk size/overlap empirically instead of by default values.
+This is **hybrid retrieval**: dense (embedding) search is good at matching meaning but can miss exact keywords/names/codes that BM25 (classic keyword search) catches reliably; combining both and reranking the merged results is one of the highest-leverage improvements to retrieval quality in a real RAG system.
+
+Concretely, still open: replacing `InMemoryVectorStore` with a persistent vector database (Chroma), adding BM25 and merging it with dense search, a cross-encoder reranker, a similarity-score threshold so retrieval can refuse to hand over irrelevant chunks, an evaluation harness (RAGAS/DeepEval) to measure retrieval and answer quality objectively rather than by eyeballing outputs, wiring `RagService` into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts, applying the existing `SYSTEM_PROMPT` to the chat session, and eventually a FastAPI service + Docker packaging.
 
 ---
 
 ## Concepts this project demonstrates
 
-For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly), the extract → chunk → embed → index pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, and a layered architecture (client / service / model / UI) that keeps each concern independently testable and replaceable.
+For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, the precision/recall gap that motivates hybrid search and reranking, and a layered architecture (client / service / model / retrieval / UI) that keeps each concern independently testable and replaceable.

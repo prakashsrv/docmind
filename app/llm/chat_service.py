@@ -6,6 +6,24 @@ from app.llm.client import client
 logger = logging.getLogger("docmind")
 
 
+def complete(prompt: str) -> str:
+    """Stateless, single-shot completion -- no chat history involved.
+
+    Used by RagService: each RAG call already carries its own full context
+    (the retrieved chunks) baked into the prompt, so it shouldn't also pile
+    into an ongoing multi-turn conversation the way ask()/stream() do.
+    """
+    try:
+        response = client.models.generate_content(
+            model=config.MODEL_NAME,
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        logger.error("API error: %s", e)
+        raise
+
+
 class ChatService:
     def __init__(self):
         # client.chats.create() gives us a session object that remembers
