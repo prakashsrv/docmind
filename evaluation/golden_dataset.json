@@ -1,0 +1,128 @@
+[
+  {
+    "id": "q01",
+    "question": "Where is CodeKarma Labs headquartered?",
+    "answerable": true,
+    "expected_chunk_keywords": ["Bangalore", "India"]
+  },
+  {
+    "id": "q02",
+    "question": "What does CodeKarma Labs build?",
+    "answerable": true,
+    "expected_chunk_keywords": ["document search", "automation"]
+  },
+  {
+    "id": "q03",
+    "question": "What is DocMind?",
+    "answerable": true,
+    "expected_chunk_keywords": ["document question-answering"]
+  },
+  {
+    "id": "q04",
+    "question": "What is TaskAgent capable of doing?",
+    "answerable": true,
+    "expected_chunk_keywords": ["AI agent", "tools"]
+  },
+  {
+    "id": "q05",
+    "question": "What technologies does the backend use?",
+    "answerable": true,
+    "expected_chunk_keywords": ["FastAPI", "Docker"]
+  },
+  {
+    "id": "q06",
+    "question": "Which embedding model does DocMind use?",
+    "answerable": true,
+    "expected_chunk_keywords": ["Gemini embedding model"]
+  },
+  {
+    "id": "q07",
+    "question": "Are documents chunked before or after they are embedded?",
+    "answerable": true,
+    "expected_chunk_keywords": ["chunked before", "embedded"]
+  },
+  {
+    "id": "q08",
+    "question": "What is Retrieval-Augmented Generation?",
+    "answerable": true,
+    "expected_chunk_keywords": ["retrieves relevant chunks", "language model"]
+  },
+  {
+    "id": "q09",
+    "question": "How does RAG help reduce hallucinations?",
+    "answerable": true,
+    "expected_chunk_keywords": ["reduces hallucinations", "grounded answers"]
+  },
+  {
+    "id": "q10",
+    "question": "What are embeddings?",
+    "answerable": true,
+    "expected_chunk_keywords": ["high-dimensional vectors", "similar meanings"]
+  },
+  {
+    "id": "q11",
+    "question": "What is hybrid search?",
+    "answerable": true,
+    "expected_chunk_keywords": ["BM25", "dense vector search"]
+  },
+  {
+    "id": "q12",
+    "question": "What does a reranker do in a hybrid search system?",
+    "answerable": true,
+    "expected_chunk_keywords": ["reorder", "relevance"]
+  },
+  {
+    "id": "q13",
+    "question": "What should a production RAG system evaluate?",
+    "answerable": true,
+    "expected_chunk_keywords": ["retrieval quality", "faithfulness"]
+  },
+  {
+    "id": "q14",
+    "question": "What techniques are commonly used for evaluating RAG systems?",
+    "answerable": true,
+    "expected_chunk_keywords": ["golden dataset", "LLM-as-a-judge"]
+  },
+  {
+    "id": "q15",
+    "question": "What is the support email address?",
+    "answerable": true,
+    "expected_chunk_keywords": ["support@example.com"]
+  },
+  {
+    "id": "q16",
+    "question": "What website should I visit for more information?",
+    "answerable": true,
+    "expected_chunk_keywords": ["example.com"]
+  },
+  {
+    "id": "n01",
+    "question": "Who won the FIFA World Cup in 2022?",
+    "answerable": false
+  },
+  {
+    "id": "n02",
+    "question": "What is the capital of France?",
+    "answerable": false
+  },
+  {
+    "id": "n03",
+    "question": "How do I file my taxes in the United States?",
+    "answerable": false
+  },
+  {
+    "id": "n04",
+    "question": "Who is the CEO of CodeKarma Labs?",
+    "answerable": false
+  },
+  {
+    "id": "n05",
+    "question": "What is DocMind's monthly pricing plan?",
+    "answerable": false
+  },
+  {
+    "id": "n06",
+    "question": "What programming language is best for game development?",
+    "answerable": false
+  }
+]

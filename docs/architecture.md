@@ -158,10 +158,15 @@ Before this, vector search always returned *something* — the top-k least-bad m
 
 `scripts/ingest.py` (embed + persist, run once per document) and `scripts/ask.py` (embed only the question, query the existing collection, answer) are the two-command version of "Load Chroma → Ready" — separating the expensive one-time cost from the cheap, repeatable one.
 
+## Evaluation: turning "should be better" into a number
+
+`evaluation/evaluator.py` and `scripts/run_eval.py` run a 22-question golden dataset (`evaluation/golden_dataset.json`) against any retrieval configuration and produce four numbers: retrieval hit-rate, LLM-as-a-judge faithfulness, LLM-as-a-judge relevance, and correct-rejection-rate (for questions with no real answer in the documents). `RagService.answer_with_chunks()` exists specifically so the evaluator can get both the answer and the chunks it was grounded in from a single retrieval call, rather than retrieving twice. Full design rationale — why two separate metric categories, why keyword-based retrieval hit-rate instead of hand-labeled chunk IDs, why a hand-rolled judge instead of RAGAS — is in `README.md`'s Part 7, not duplicated here.
+
 ## Current limitations (see `README.md` → "What's next")
 
-- The flows above aren't connected to `main.py`'s interactive chat loop yet — there's no single running application, only test scripts / `ingest.py` + `ask.py` that exercise the full pipeline.
-- No evaluation harness yet: there's no golden dataset or automated way to measure retrieval/faithfulness quality, so every claim about hybrid search or reranking "improving" results so far is qualitative (a specific example query), not a measured number. That's the explicit next step.
+- The flows above aren't connected to `main.py`'s interactive chat loop yet — there's no single running application, only test scripts / `ingest.py` + `ask.py` / `run_eval.py` that exercise the full pipeline.
+- The golden dataset (22 questions) is smaller than the ~50 the project's guide suggests, because it's grounded in one small sample document. Numbers from it are directionally real, not a large-sample guarantee.
+- Retrieval-quality scoring is a keyword-presence proxy, not per-question hand-labeled correct chunk IDs — see README Part 7 for the trade-off.
 - `BM25Retriever` rebuilds its keyword index from scratch on construction (`BM25Okapi([...])` over the whole corpus) — fine for the corpus sizes here, but unlike `ChromaVectorStore` it has no persistence of its own yet.
 - The similarity threshold is a single global constant, not calibrated against real usage data — see the section above.
 - `ChromaVectorStore.search()` doesn't return the chunk's embedding vector (Chroma isn't asked for it back, since nothing downstream needs it) — a real difference from `InMemoryVectorStore`, which happens to return the original in-memory object with its embedding intact. Don't rely on `chunk.embedding` being populated after any search.

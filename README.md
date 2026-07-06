@@ -12,10 +12,11 @@ DocMind is now a working Retrieval-Augmented Generation (RAG) system, built up i
 
 1. A streaming, multi-turn terminal chatbot backed by Google's Gemini API.
 2. A document-ingestion pipeline: PDF → text → overlapping chunks.
-3. A semantic search layer: chunks → embeddings → an in-memory vector store you can query by meaning, not keywords.
+3. A semantic search layer: chunks → embeddings → an in-memory or persistent (Chroma) vector store, searchable by dense (embedding), keyword (BM25), or fused hybrid retrieval, optionally reranked by a cross-encoder.
 4. A retrieval-augmented answer layer: question → relevant chunks → a grounded, cited answer from Gemini — instead of an answer from the model's training data alone.
+5. An evaluation harness: a golden question/answer dataset run automatically against any retrieval configuration, producing retrieval hit-rate, faithfulness, relevance, and "correctly said I don't know" rates — a measured number instead of an impression.
 
-Phases 1-3 and Phase 4 are still two separate entry points in the code (the interactive chatbot in `main.py` doesn't call into retrieval yet), but the full pipeline — PDF in, grounded answer with citations out — works end to end via `scripts/test_rag.py`. Everything below reflects what's actually implemented.
+This follows a published two-project AI-engineer portfolio guide; DocMind is "Project 1" in that guide. The interactive chatbot in `main.py` and the retrieval/eval stack are still separate entry points in the code (no single running application yet), but the full pipeline — PDF in, grounded and cited answer out, measured against a golden set — works end to end via `scripts/run_eval.py`. Everything below reflects what's actually implemented.
 
 ---
 
@@ -58,7 +59,11 @@ docmind/
 │   ├── test_hybrid.py            # Manual test: dense vs BM25 vs hybrid, side by side
 │   ├── test_rerank.py            # Manual test: hybrid vs hybrid+cross-encoder-reranked
 │   ├── ingest.py                 # Persist a PDF's embedded chunks into Chroma (run once per doc)
-│   └── ask.py                    # Ask a question against the persisted Chroma store (no re-embedding)
+│   ├── ask.py                    # Ask a question against the persisted Chroma store (no re-embedding)
+│   └── run_eval.py               # Run the golden dataset against dense/hybrid/hybrid+rerank, compare
+├── evaluation/
+│   ├── golden_dataset.json       # 22 question/answer pairs (16 answerable, 6 deliberately not)
+│   └── evaluator.py              # Retrieval hit-rate, LLM-as-judge faithfulness/relevance, reject-rate
 ├── tests/
 │   ├── test_chunker.py               # Unit tests: chunking + overlap math
 │   ├── test_embeddings.py            # Unit tests: EmbeddingService (Gemini API mocked)
@@ -68,7 +73,9 @@ docmind/
 │   ├── test_bm25_retriever.py        # Unit tests: keyword matching, zero-overlap filtering
 │   ├── test_hybrid_retriever.py      # Unit tests: Reciprocal Rank Fusion, fallback to BM25
 │   ├── test_reranker.py              # Unit tests: CrossEncoderReranker (model mocked)
-│   └── test_reranking_retriever.py   # Unit tests: RerankingRetriever wiring (deps mocked)
+│   ├── test_reranking_retriever.py   # Unit tests: RerankingRetriever wiring (deps mocked)
+│   ├── test_rag_service.py           # Unit tests: RagService citations, fallback, answer_with_chunks
+│   └── test_evaluator.py             # Unit tests: retrieval-hit logic, judge parsing, aggregation
 ├── docs/
 │   ├── architecture.md           # Component diagram, index-time vs query-time flow
 │   └── ingestion.md              # PDF -> chunk -> embedding pipeline, in depth
@@ -149,11 +156,19 @@ python scripts/test_hybrid.py data/documents/your_file.pdf "your question here"
 python scripts/test_rerank.py data/documents/your_file.pdf "your question here"
 ```
 
+**Run the golden dataset against dense, hybrid, and hybrid+reranked retrieval, and compare:**
+
+```bash
+python scripts/run_eval.py data/documents/Sample_RAG_Test_Document.pdf
+```
+
+This calls the real Gemini API for every question in `evaluation/golden_dataset.json` (once to answer, once more per answerable question for LLM-as-a-judge scoring) across all three retrieval modes, so expect real API cost and a few minutes of runtime — see Part 7, below, for what the output means.
+
 ---
 
 ## Tests
 
-Unit tests cover the pieces that don't need a live API call to verify — chunking math and `Retriever`/`EmbeddingService` wiring, with Gemini calls mocked out via `unittest.mock`. They run offline and don't touch your `.env` or API quota.
+Unit tests (59 of them) cover the pieces that don't need a live API call to verify — chunking math, retrieval wiring across every retriever (dense, BM25, hybrid, reranking), `RagService`, and the evaluation harness's own scoring logic — with Gemini and the cross-encoder model mocked out via `unittest.mock`. They run offline and don't touch your `.env` or API quota.
 
 ```bash
 pip install pytest
@@ -519,22 +534,58 @@ Crucially, reranking doesn't add its own relevance gate — it only re-orders wh
 
 `sentence-transformers` pulls in `torch`, by far the heaviest dependency in this project (hundreds of MB). Importing `app.retrieval.reranker` does **not** require `torch` or `sentence-transformers` to be installed — the `from sentence_transformers import CrossEncoder` import is deferred inside `_get_model()`, which only runs the first time `.rerank()` is actually called, and the loaded model is cached at module level afterward so it only loads once per process, not once per call. This is why `tests/test_reranker.py` and `tests/test_reranking_retriever.py` can run (and did, as part of the 43-test suite) without the real dependency installed at all — they mock `_get_model()` directly. Only `scripts/test_rerank.py`, which needs the real model, requires `pip install sentence-transformers` first.
 
-`scripts/test_rerank.py` runs hybrid retrieval both before and after reranking for the same question, so the reordering is visible rather than theoretical — this comparison (hybrid alone vs. hybrid + reranked) is exactly what the next phase's evaluation harness is meant to turn into an actual number.
+`scripts/test_rerank.py` runs hybrid retrieval both before and after reranking for the same question, so the reordering is visible rather than theoretical — this comparison (hybrid alone vs. hybrid + reranked) is exactly what the evaluation harness (below) turns into an actual measured number.
+
+---
+
+## Part 7 — The evaluation harness (`evaluation/`)
+
+Described in the guide this project follows as "the hero feature" — the single most important artifact for an AI-engineering interview, because it's the difference between "I used hybrid search and reranking" (a claim) and "retrieval relevance went from 0.62 to 0.91 after adding reranking" (a measurement).
+
+### Two different things are being measured, on purpose
+
+**Retrieval quality** asks: did the retriever fetch a chunk that actually contains the answer? This is checked in `evaluation/evaluator.py`'s `_retrieval_hit()` by looking for a set of expected keywords (defined per-question in the golden dataset) somewhere in the concatenated retrieved text. That's a simplification worth being explicit about — a "real" retrieval-quality metric (like RAGAS's `context_precision`/`context_recall`) would compare against a hand-labeled correct chunk ID per question; keyword presence is a cheaper proxy that doesn't require maintaining that mapping by hand, at the cost of being possible to satisfy by coincidence (a keyword appearing in an otherwise-irrelevant chunk).
+
+**Faithfulness and relevance** ask a different question: given what was *actually* retrieved, is the generated answer grounded in it (not hallucinating) and does it actually address the question? These can't be checked by keyword matching, since correct answers can be phrased in many ways — so they're scored by an **LLM-as-a-judge**: a second call to Gemini, with a prompt (`JUDGE_PROMPT_TEMPLATE`) that hands the judge the question, the retrieved context, and the generated answer, and asks for two 0-1 scores back as JSON. This is the hand-rolled alternative to a RAGAS integration the guide also mentions — same idea (an LLM grading another LLM's output against retrieved evidence), without adding RAGAS as a dependency.
+
+For the six deliberately unanswerable questions in the golden dataset (things like "who won the FIFA World Cup"), neither of those metrics applies — the only thing that matters is whether the system said `NOT_FOUND_MESSAGE`, checked with an exact string comparison, no judge needed. This is the **correct-rejection rate**, and it's arguably the most important number for interview purposes if it's ever low: it directly answers "does this system know when it doesn't know," which faithfulness/relevance alone can't quite capture.
+
+### The golden dataset
+
+`evaluation/golden_dataset.json` has 22 questions (16 answerable, 6 not) written against the actual content of `data/documents/Sample_RAG_Test_Document.pdf` — every `expected_chunk_keywords` entry was checked against the real extracted PDF text before being committed, not just plausible-sounding. This is honestly smaller than the guide's suggested ~50; with only one small sample document to draw from, writing 50 non-redundant questions would mean padding with near-duplicates rather than genuine coverage. The schema and harness scale to more without any code changes — add more real documents, write more questions per fact, and the dataset naturally grows toward 50+.
+
+### Running it
+
+```python
+def build_retriever(mode, store):
+    if mode == "dense":
+        return Retriever(store)
+    if mode == "hybrid":
+        return HybridRetriever(Retriever(store), BM25Retriever(store.get_all_chunks()))
+    if mode == "hybrid_rerank":
+        return RerankingRetriever(HybridRetriever(...))
+```
+
+`scripts/run_eval.py` builds each retrieval configuration around the *same* ingested chunks, runs the entire golden dataset through each one via `evaluate()`, and prints a comparison table — `dense` vs. `hybrid` vs. `hybrid_rerank`, side by side, with retrieval hit-rate, faithfulness, relevance, correct-rejection-rate, and wall-clock time per mode. That table is the literal source of the headline metric: run it, and whatever numbers come out for `hybrid` vs. `hybrid_rerank` are your real, project-specific version of "relevance went from X to Y."
+
+### Why `answer_with_chunks()` exists
+
+`RagService` previously only exposed `answer(question) -> str`. The evaluator needs both the answer (to judge faithfulness/relevance) *and* the chunks that were actually retrieved (to check retrieval hit-rate) from the same call — calling `retrieve()` a second time to get the chunks would double the embedding API calls per question and, in principle, could retrieve different results than what the answer was actually grounded in. `answer_with_chunks()` returns both from a single retrieval pass; `answer()` is now a two-line wrapper around it, so existing callers (`main.py`, `scripts/ask.py`, `scripts/test_rag.py`) are unaffected.
 
 ---
 
 ## What's next
 
-Per the guide this project follows, DocMind (Project 1) is now through Stage 5 of 7: LLM API foundations, ingestion/chunking, embeddings + vector DB, hybrid retrieval + reranking, and grounded generation with citations are all built. What's left:
+Per the guide this project follows, DocMind (Project 1) is now through all 7 of its stages: LLM API foundations, ingestion/chunking, embeddings + vector DB, hybrid retrieval + reranking, grounded generation with citations, and the evaluation harness are all built. What's left is Stage 7 (from the guide's own numbering, distinct from this project's "Part 7" above) plus a handful of smaller items:
 
-**Stage 6 — the evaluation harness.** Explicitly "the hero feature" of the whole project: a golden dataset of roughly 50 question/answer pairs against your own documents, and a script that runs the full pipeline against every question and measures two things — retrieval quality (did it fetch the right chunks?) and faithfulness (did the answer actually stick to the retrieved context, or hallucinate?). The entire point of building the eval harness now, rather than earlier, is to run it against the retrieval pipeline in two configurations — hybrid alone, and hybrid + reranked — and produce the headline number: "retrieval relevance went from X to Y after adding reranking." That's the interview-ready line this whole project has been building toward, and it only means something because both configurations already exist to compare (Parts 5 and 6, above).
+**Serving it.** A FastAPI service (`/upload`, `/query` endpoints), Docker packaging, and per-query cost/latency logging (tokens in/out, dollars per query) — turning DocMind from a library plus test scripts into an actual running service, which is also the shape `TaskAgent` (a separate, tool-using-agent project in the same guide) expects to call as one of its tools.
 
-**Stage 7 — serving it.** A FastAPI service (`/upload`, `/query` endpoints), Docker packaging, and per-query cost/latency logging (tokens in/out, dollars per query) — turning DocMind from a library plus test scripts into an actual running service, which is also the shape `TaskAgent` (a separate, tool-using-agent project) expects to call as one of its tools.
+Smaller open items: richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3"; wiring `RagService`/the retrieval stack into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts; applying the existing `SYSTEM_PROMPT` to the chat session; growing the golden dataset toward the guide's ~50-question target as more real documents get added; and optionally swapping `ChromaVectorStore` for `pgvector` later, to learn a production-grade Postgres-backed store once Chroma's local-first approach has served its purpose.
 
-Smaller open items along the way: richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3"; wiring `RagService`/the retrieval stack into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts; applying the existing `SYSTEM_PROMPT` to the chat session; and optionally swapping `ChromaVectorStore` for `pgvector` later, to learn a production-grade Postgres-backed store once Chroma's local-first approach has served its purpose.
+Once `scripts/run_eval.py` has actually been run against real documents, the resulting numbers — not placeholders — belong in this README and on a resume. That's the entire point of Part 7.
 
 ---
 
 ## Concepts this project demonstrates
 
-For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, a similarity threshold as the mechanism that lets a retriever say "I don't know" instead of always returning its best-available guess, designing an interface (`add`/`search`/`search_with_scores`) so a storage backend can be swapped from an in-memory list to a persistent database without touching any calling code, deterministic ID generation as a prerequisite for idempotent upserts, dense vs. keyword (BM25) search as complementary rather than competing signals, Reciprocal Rank Fusion as a way to merge rankings from incomparable scoring scales without normalizing either one, bi-encoder vs. cross-encoder architectures as a precompute-vs-precision trade-off, lazy imports as a way to keep a heavy optional dependency from leaking into every other module's testability, and a layered architecture (client / service / model / retrieval / storage / UI) that keeps each concern independently testable and replaceable.
+For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, a similarity threshold as the mechanism that lets a retriever say "I don't know" instead of always returning its best-available guess, designing an interface (`add`/`search`/`search_with_scores`) so a storage backend can be swapped from an in-memory list to a persistent database without touching any calling code, deterministic ID generation as a prerequisite for idempotent upserts, dense vs. keyword (BM25) search as complementary rather than competing signals, Reciprocal Rank Fusion as a way to merge rankings from incomparable scoring scales without normalizing either one, bi-encoder vs. cross-encoder architectures as a precompute-vs-precision trade-off, lazy imports as a way to keep a heavy optional dependency from leaking into every other module's testability, LLM-as-a-judge as a way to score open-ended output that keyword matching can't, deliberately separating retrieval-quality metrics from faithfulness/relevance metrics because they answer different questions, treating a golden dataset as the artifact that turns a claim into a measurement, and a layered architecture (client / service / model / retrieval / storage / evaluation / UI) that keeps each concern independently testable and replaceable.
