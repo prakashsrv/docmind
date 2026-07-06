@@ -34,14 +34,30 @@ class InMemoryVectorStore:
     def add(self, chunks: list[Chunk]) -> None:
         self.chunks.extend(chunks)
 
-    def search(self, query_vector: list[float], top_k: int = None) -> list[Chunk]:
-        top_k = top_k or config.TOP_K
-
+    def _ranked(self, query_vector: list[float]) -> list[tuple[float, Chunk]]:
+        """Every stored chunk, scored against the query and sorted best-first.
+        Shared by search() and search_with_scores() so there's one place
+        that does the actual comparison.
+        """
         scored = [
             (cosine_similarity(query_vector, chunk.embedding), chunk)
             for chunk in self.chunks
             if chunk.embedding is not None
         ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
+        return scored
 
-        return [chunk for _, chunk in scored[:top_k]]
+    def search(self, query_vector: list[float], top_k: int = None) -> list[Chunk]:
+        top_k = top_k or config.TOP_K
+        return [chunk for _, chunk in self._ranked(query_vector)[:top_k]]
+
+    def search_with_scores(
+        self, query_vector: list[float], top_k: int = None
+    ) -> list[tuple[float, Chunk]]:
+        """Same ranking as search(), but keeps the similarity score attached
+        to each chunk -- callers that need to decide "is this good enough"
+        (Retriever's threshold check) or just want to inspect scores for
+        calibration need the score, not just the chunk.
+        """
+        top_k = top_k or config.TOP_K
+        return self._ranked(query_vector)[:top_k]

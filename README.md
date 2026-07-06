@@ -52,7 +52,8 @@ docmind/
 ├── tests/
 │   ├── test_chunker.py           # Unit tests: chunking + overlap math
 │   ├── test_embeddings.py        # Unit tests: EmbeddingService (Gemini API mocked)
-│   └── test_retriever.py         # Unit tests: Retriever wiring (deps mocked)
+│   ├── test_vector_store.py      # Unit tests: cosine similarity, ranking, top_k
+│   └── test_retriever.py         # Unit tests: Retriever wiring + similarity threshold
 ├── docs/
 │   ├── architecture.md           # Component diagram, index-time vs query-time flow
 │   └── ingestion.md              # PDF -> chunk -> embedding pipeline, in depth
@@ -338,9 +339,29 @@ return f"{answer}\n\nSources: {sources}"
 
 The model can still get the *answer* wrong, but it can't fabricate a citation to a chunk that was never in its prompt — the set of possible citations is constrained by code, not by the model's honesty.
 
-### The "I don't know" fallback, and its current limitation
+### The "I don't know" fallback
 
-`NOT_FOUND_MESSAGE` is a single constant shared between the prompt (which tells Gemini to return it verbatim when the answer isn't in the context) and `RagService` (which checks for it to decide whether attaching "Sources:" even makes sense). Worth being honest about a real gap here: cosine similarity search always returns *something* — the top-k least-bad matches — even for a question with no relevant content in the document at all, like "who won the World Cup" against a document about RAG architecture. There's no similarity-score threshold filtering out weak matches before they reach the prompt, so today the fallback relies entirely on the model following instructions rather than on retrieval refusing to return irrelevant chunks. That's precisely the gap that reranking and score thresholds (below) are meant to close.
+`NOT_FOUND_MESSAGE` is a single constant shared between the prompt (which tells Gemini to return it verbatim when the answer isn't in the context) and `RagService` (which checks for it to decide whether attaching "Sources:" even makes sense). This used to rely entirely on the model following instructions, since vector search always returned *something*. That gap is now closed by the similarity threshold below — `Retriever` can now return zero chunks, which triggers this fallback deterministically rather than hoping the model behaves.
+
+---
+
+## Part 4 — Retrieval quality: a similarity threshold (`app/retrieval/retriever.py`)
+
+Version 1 had a real problem, easiest to see with an example: imagine a knowledge base containing a resume, an Android guide, a Flutter cookbook, and a Python guide. Ask "What is Jetpack Compose?" and dense vector search might rank the Flutter guide and the resume above the actually-relevant Android guide — embeddings capture meaning well, but not perfectly, and "top-k" search has no concept of "good enough," only "best available." Ask something with *no* relevant answer anywhere in the store, and the same problem gets worse: search still confidently returns its top-k least-bad matches, and the LLM gets fed irrelevant context that invites a hallucinated answer.
+
+The fix: `Retriever.retrieve()` now checks each candidate's cosine similarity score against `config.SIMILARITY_THRESHOLD` (default `0.70`) and drops anything below it, rather than trusting `top_k` alone:
+
+```python
+scored = self.vector_store.search_with_scores(query_vector, top_k=top_k)
+accepted = [(score, chunk) for score, chunk in scored if score >= min_score]
+return [chunk for _, chunk in accepted]
+```
+
+If nothing clears the bar, `retrieve()` returns `[]`, `RagService` sees an empty chunk list, and returns `NOT_FOUND_MESSAGE` immediately — no LLM call needed, and no dependence on the model choosing to admit uncertainty.
+
+This required exposing scores, not just chunks, out of the vector store: `InMemoryVectorStore.search_with_scores()` returns `list[tuple[float, Chunk]]` instead of just `list[Chunk]`, sharing its ranking logic with the original `search()` via a private `_ranked()` helper so there's only one place that actually computes similarity and sorts.
+
+**On the threshold value itself:** `0.70` is a starting guess, explicitly not a calibrated one — cosine similarity distributions depend on the embedding model, and setting this too high silently rejects real answers as "not found," while too low defeats the purpose. `Retriever` logs the best score and rejection count on every call, and `scripts/test_search.py` now prints per-chunk scores specifically so this number can be tuned against real queries and documents instead of guessed. Treat it as a knob to revisit once you have more usage data — this is exactly the kind of thing `docs/architecture.md`'s "Retrieval quality" section and the Week 3 evaluation harness (below) are meant to make measurable rather than eyeballed.
 
 ---
 
@@ -367,7 +388,9 @@ Dense (embedding) search             BM25 keyword search
 
 This is **hybrid retrieval**: dense (embedding) search is good at matching meaning but can miss exact keywords/names/codes that BM25 (classic keyword search) catches reliably; combining both and reranking the merged results is one of the highest-leverage improvements to retrieval quality in a real RAG system.
 
-Concretely, still open: replacing `InMemoryVectorStore` with a persistent vector database (Chroma), adding BM25 and merging it with dense search, a cross-encoder reranker, a similarity-score threshold so retrieval can refuse to hand over irrelevant chunks, an evaluation harness (RAGAS/DeepEval) to measure retrieval and answer quality objectively rather than by eyeballing outputs, wiring `RagService` into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts, applying the existing `SYSTEM_PROMPT` to the chat session, and eventually a FastAPI service + Docker packaging.
+Concretely, still open: replacing `InMemoryVectorStore` with a persistent vector database (Chroma), adding BM25 and merging it with dense search, a cross-encoder reranker, richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3", an evaluation harness (RAGAS/DeepEval or a hand-built `evaluation/dataset.json` of question → expected-answer pairs) to measure retrieval and answer quality objectively rather than by eyeballing outputs, wiring `RagService` into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts, applying the existing `SYSTEM_PROMPT` to the chat session, and eventually a FastAPI service + Docker packaging.
+
+Done, as of this update: the similarity threshold (Part 4, above) — the highest-priority item on the retrieval-quality list, since a retriever that can say "I don't know" is the foundation everything else (hybrid search, reranking, evaluation) builds on.
 
 ---
 

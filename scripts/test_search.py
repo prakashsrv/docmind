@@ -29,11 +29,15 @@ def main():
     store.add(chunks)
 
     query_vector = EmbeddingService().embed(query)
-    results = store.search(query_vector, top_k=3)
+    results = store.search_with_scores(query_vector, top_k=5)
 
     print(f"Query: {query}\n")
-    for rank, chunk in enumerate(results, start=1):
-        print(f"--- Match {rank} (chunk_index={chunk.chunk_index}) ---")
+    print("Use these scores to calibrate config.SIMILARITY_THRESHOLD -- run a")
+    print("few genuinely relevant queries and a few genuinely irrelevant ones")
+    print("and see where the scores actually separate.\n")
+
+    for rank, (score, chunk) in enumerate(results, start=1):
+        print(f"--- Match {rank} (chunk_index={chunk.chunk_index}, score={score:.3f}) ---")
         print(chunk.text[:300])
         print()
 

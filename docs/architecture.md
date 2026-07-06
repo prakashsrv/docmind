@@ -80,7 +80,31 @@ This whole flow is `app/ingestion/pipeline.py`'s `process_pdf(path)`, which retu
 
 Each row can change without the others noticing, as long as the boundary (its public functions/classes) stays the same — e.g. `InMemoryVectorStore` can become a Chroma-backed store, and nothing in `app/retrieval/` has to change, because `Retriever` only calls `.add()` / `.search()`.
 
+## Retrieval quality: the similarity threshold
+
+`Retriever.retrieve()` now filters out chunks below `config.SIMILARITY_THRESHOLD` (default `0.70`) before they ever reach `RagService`:
+
+```
+Question
+    │
+    ▼
+Embed + search (top-k, with scores)
+    │
+    ▼
+Is best score >= SIMILARITY_THRESHOLD?
+    │                          │
+   YES                         NO
+    │                          │
+    ▼                          ▼
+Return matching chunks    Return []  →  RagService's NOT_FOUND_MESSAGE
+```
+
+Before this, vector search always returned *something* — the top-k least-bad matches — even for a question with nothing relevant in the store (e.g. "who won the World Cup" against a document about RAG architecture). The fallback message relied entirely on the LLM following instructions. Now the retriever itself refuses to hand over context it isn't confident about, which is a stronger and cheaper guarantee than trusting the model to say "I don't know."
+
+`Retriever` also logs the best score and how many candidates were rejected on every call (`app/retrieval/retriever.py`), and `scripts/test_search.py` prints per-chunk scores — both exist so the threshold can be calibrated empirically against real queries and documents rather than left at the default guess. **0.70 is a starting point, not a validated number** — cosine similarity score distributions vary by embedding model, so run a handful of genuinely relevant and genuinely irrelevant queries through `test_search.py` and look at where the scores actually separate before trusting it in production.
+
 ## Current limitations (see `README.md` → "What's next")
 
 - The two flows above aren't connected to `main.py`'s interactive chat loop yet — there's no single running application, only test scripts that exercise the full pipeline.
-- Retrieval is dense (embedding) search only; no keyword (BM25) matching or reranking yet, so a query with no genuinely relevant content still returns the least-bad chunks rather than none.
+- Retrieval is dense (embedding) search only; no keyword (BM25) matching or reranking yet, so a query can still fail to surface a chunk that a plain keyword match would have caught (e.g. an exact library name like "PyMuPDF").
+- The similarity threshold is a single global constant, not calibrated against real usage data — see the section above.

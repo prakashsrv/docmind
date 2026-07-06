@@ -9,3 +9,12 @@ CHUNK_OVERLAP = 100
 # Embeddings (Phase 3)
 EMBEDDING_MODEL_NAME = "gemini-embedding-001"
 TOP_K = 5
+
+# Retrieval quality (Phase 4)
+# A chunk must score at least this well (cosine similarity, 0-1) to be
+# considered relevant at all. This is a starting value, not a calibrated
+# one -- run scripts/test_search.py against your real documents and look at
+# the printed scores for genuinely relevant vs. irrelevant queries before
+# trusting this number. Too high and real answers get rejected as "not
+# found"; too low and irrelevant chunks still reach the LLM.
+SIMILARITY_THRESHOLD = 0.70
