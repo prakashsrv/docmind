@@ -41,25 +41,31 @@ docmind/
 │   │   ├── embedding_service.py  # Text -> vector (Gemini embeddings)
 │   │   └── vector_store.py       # In-memory store + cosine similarity search
 │   ├── retrieval/
-│   │   ├── retriever.py          # Question -> relevant Chunks
+│   │   ├── retriever.py          # Question -> relevant Chunks (similarity threshold applied)
 │   │   └── rag_service.py        # Question -> grounded answer + sources
+│   ├── storage/
+│   │   └── chroma_store.py       # Persistent, disk-backed vector store (same interface as in-memory)
 │   └── ui/
 │       └── console.py            # Rich-based terminal rendering
 ├── scripts/
-│   ├── test_pipeline.py          # Manual test: ingest + embed a PDF
-│   ├── test_search.py            # Manual test: ingest, then semantic search
-│   └── test_rag.py               # Manual test: full RAG loop, question -> cited answer
+│   ├── test_pipeline.py          # Manual test: ingest + embed a PDF (in-memory, throwaway)
+│   ├── test_search.py            # Manual test: ingest, then semantic search (in-memory)
+│   ├── test_rag.py               # Manual test: full RAG loop, in-memory store
+│   ├── ingest.py                 # Persist a PDF's embedded chunks into Chroma (run once per doc)
+│   └── ask.py                    # Ask a question against the persisted Chroma store (no re-embedding)
 ├── tests/
 │   ├── test_chunker.py           # Unit tests: chunking + overlap math
 │   ├── test_embeddings.py        # Unit tests: EmbeddingService (Gemini API mocked)
 │   ├── test_vector_store.py      # Unit tests: cosine similarity, ranking, top_k
+│   ├── test_chroma_store.py      # Integration tests: ChromaVectorStore (real, on-disk, no mocks)
 │   └── test_retriever.py         # Unit tests: Retriever wiring + similarity threshold
 ├── docs/
 │   ├── architecture.md           # Component diagram, index-time vs query-time flow
 │   └── ingestion.md              # PDF -> chunk -> embedding pipeline, in depth
 ├── screenshots/                  # Terminal screenshots for reviewers (see screenshots/README.md)
 ├── data/
-│   └── documents/                # Source PDFs (gitignored, except .gitkeep)
+│   ├── documents/                # Source PDFs (gitignored, except .gitkeep)
+│   └── chroma/                   # Persisted Chroma database (gitignored, regenerate via scripts/ingest.py)
 ├── conftest.py                   # Puts the project root on sys.path for pytest
 ├── main.py                       # Entry point for the interactive chatbot
 └── .env                          # GEMINI_API_KEY (gitignored)
@@ -74,7 +80,7 @@ Each folder has exactly one job. This mirrors a pattern you'd recognize from mob
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install google-genai python-dotenv rich pymupdf
+pip install google-genai python-dotenv rich pymupdf chromadb
 ```
 
 Create a `.env` file in the project root:
@@ -107,10 +113,17 @@ python scripts/test_pipeline.py data/documents/your_file.pdf
 python scripts/test_search.py data/documents/your_file.pdf "your query here"
 ```
 
-**Ask a grounded, cited question over a PDF (full RAG):**
+**Ask a grounded, cited question over a PDF (full RAG, in-memory):**
 
 ```bash
 python scripts/test_rag.py data/documents/your_file.pdf "your question here"
+```
+
+**Persist a PDF to disk, then ask questions without re-embedding it:**
+
+```bash
+python scripts/ingest.py data/documents/your_file.pdf   # run once per document
+python scripts/ask.py "your question here"               # run any time after
 ```
 
 ---
@@ -363,6 +376,28 @@ This required exposing scores, not just chunks, out of the vector store: `InMemo
 
 **On the threshold value itself:** `0.70` is a starting guess, explicitly not a calibrated one — cosine similarity distributions depend on the embedding model, and setting this too high silently rejects real answers as "not found," while too low defeats the purpose. `Retriever` logs the best score and rejection count on every call, and `scripts/test_search.py` now prints per-chunk scores specifically so this number can be tuned against real queries and documents instead of guessed. Treat it as a knob to revisit once you have more usage data — this is exactly the kind of thing `docs/architecture.md`'s "Retrieval quality" section and the Week 3 evaluation harness (below) are meant to make measurable rather than eyeballed.
 
+## Persistence: swapping in ChromaDB (`app/storage/chroma_store.py`)
+
+Every script up to this point rebuilt its vector store from scratch on every run: `process_pdf()` re-extracts, re-chunks, and re-embeds a PDF every single time, which is fine for experimentation but means a real application would redo (and re-pay for) that work on every restart. `ChromaVectorStore` fixes that by writing embeddings to disk instead of a Python list that dies when the process exits.
+
+The interface is identical to `InMemoryVectorStore` on purpose — `add(chunks)`, `search(query_vector, top_k)`, `search_with_scores(query_vector, top_k)` — because `Retriever` only ever calls those three methods and has no idea which implementation it's holding:
+
+```python
+Retriever(InMemoryVectorStore())   # rebuilt every run
+Retriever(ChromaVectorStore())      # persisted on disk, instant on restart
+```
+
+A few things worth understanding about how the swap actually works, not just that it works:
+
+- **Cosine distance vs. cosine similarity.** Chroma's default distance metric is squared L2; the collection is created with `metadata={"hnsw:space": "cosine"}` so it computes cosine distance instead, which is `1 - cosine_similarity`. `ChromaVectorStore` converts that back (`similarity = 1 - distance`) so `SIMILARITY_THRESHOLD` and the rest of the app never need to know Chroma uses a different convention than `vector_store.py`'s own `cosine_similarity()`.
+- **Deterministic IDs enable upserting.** Chroma's `add()` errors on duplicate ids, and a naive `add()`-every-time would either crash or (if you switch to blind upserts) silently duplicate every chunk on every re-run. `chunk.id` is now derived as `f"{document.id}-{chunk_index}"`, and `document.id` is a hash of the extracted text (`app/ingestion/pipeline.py`) rather than a random `uuid4`. Re-ingesting the same PDF now produces the exact same ids every time, so `collection.upsert()` overwrites the existing rows in place instead of accumulating duplicates.
+- **Metadata has to be flat.** Chroma's metadata values must be strings/ints/floats/bools, not nested structures, so `Chunk.metadata` (an arbitrary dict) is JSON-serialized into a single `metadata_json` string field and parsed back out on read, rather than passed through directly.
+- **A real behavioral difference from `InMemoryVectorStore`:** chunks coming back from `ChromaVectorStore.search()` have `embedding=None` — the vector isn't requested back from Chroma on query, since nothing downstream (`RagService`, citations) needs it after retrieval. `InMemoryVectorStore` happens to return the original `Chunk` object with its embedding intact, purely as a side effect of being backed by a plain list. Don't rely on `chunk.embedding` being populated after a search with either store.
+
+New scripts reflect the resulting two-step workflow: `scripts/ingest.py <pdf>` does the expensive part once (extract, chunk, embed, persist), and `scripts/ask.py "<question>"` does the cheap part (open the existing Chroma collection, embed only the question, search, generate) — which is the "Load Chroma → Ready" startup the mentor plan describes, versus `scripts/test_rag.py`'s "reprocess everything, every time."
+
+`tests/test_chroma_store.py` covers this with real Chroma instances against a throwaway `tmp_path` directory per test (not mocks — Chroma is a local embedded database with no network calls, so there's no reason to fake it) — upserting, empty-store behavior, metadata round-tripping, and `top_k`.
+
 ---
 
 ## What's next
@@ -388,12 +423,12 @@ Dense (embedding) search             BM25 keyword search
 
 This is **hybrid retrieval**: dense (embedding) search is good at matching meaning but can miss exact keywords/names/codes that BM25 (classic keyword search) catches reliably; combining both and reranking the merged results is one of the highest-leverage improvements to retrieval quality in a real RAG system.
 
-Concretely, still open: replacing `InMemoryVectorStore` with a persistent vector database (Chroma), adding BM25 and merging it with dense search, a cross-encoder reranker, richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3", an evaluation harness (RAGAS/DeepEval or a hand-built `evaluation/dataset.json` of question → expected-answer pairs) to measure retrieval and answer quality objectively rather than by eyeballing outputs, wiring `RagService` into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts, applying the existing `SYSTEM_PROMPT` to the chat session, and eventually a FastAPI service + Docker packaging.
+Concretely, still open: adding BM25 and merging it with dense search, a cross-encoder reranker, richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3", an evaluation harness (RAGAS/DeepEval or a hand-built `evaluation/dataset.json` of question → expected-answer pairs) to measure retrieval and answer quality objectively rather than by eyeballing outputs, wiring `RagService` into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts, applying the existing `SYSTEM_PROMPT` to the chat session, and eventually a FastAPI service + Docker packaging.
 
-Done, as of this update: the similarity threshold (Part 4, above) — the highest-priority item on the retrieval-quality list, since a retriever that can say "I don't know" is the foundation everything else (hybrid search, reranking, evaluation) builds on.
+Done, as of this update: the similarity threshold (Part 4, above) — the highest-priority item on the retrieval-quality list, since a retriever that can say "I don't know" is the foundation everything else (hybrid search, reranking, evaluation) builds on — and swapping `InMemoryVectorStore` for a persistent `ChromaVectorStore`, so embeddings survive a restart instead of being recomputed every run.
 
 ---
 
 ## Concepts this project demonstrates
 
-For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, the precision/recall gap that motivates hybrid search and reranking, and a layered architecture (client / service / model / retrieval / UI) that keeps each concern independently testable and replaceable.
+For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, a similarity threshold as the mechanism that lets a retriever say "I don't know" instead of always returning its best-available guess, designing an interface (`add`/`search`/`search_with_scores`) so a storage backend can be swapped from an in-memory list to a persistent database without touching any calling code, deterministic ID generation as a prerequisite for idempotent upserts, the precision/recall gap that motivates hybrid search and reranking, and a layered architecture (client / service / model / retrieval / storage / UI) that keeps each concern independently testable and replaceable.

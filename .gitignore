@@ -8,3 +8,6 @@ __pycache__/
 # Ingestion source documents (personal / copyrighted, don't commit)
 data/documents/*
 !data/documents/.gitkeep
+
+# Persistent Chroma vector store -- regenerate locally via scripts/ingest.py
+data/chroma/

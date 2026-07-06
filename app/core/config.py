@@ -18,3 +18,7 @@ TOP_K = 5
 # trusting this number. Too high and real answers get rejected as "not
 # found"; too low and irrelevant chunks still reach the LLM.
 SIMILARITY_THRESHOLD = 0.70
+
+# Persistent vector storage (Phase 4, Step 2)
+CHROMA_PERSIST_DIR = "data/chroma"
+CHROMA_COLLECTION_NAME = "docmind"

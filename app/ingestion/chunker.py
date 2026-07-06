@@ -1,5 +1,3 @@
-import uuid
-
 from app.core import config
 from app.models.chunk import Chunk
 from app.models.document import Document
@@ -43,7 +41,11 @@ def chunk_document(document: Document, chunk_size: int = None, overlap: int = No
 
     return [
         Chunk(
-            id=str(uuid.uuid4()),
+            # Derived from document.id + position, not a random uuid4, so
+            # re-chunking the same document produces the same chunk ids --
+            # required for ChromaVectorStore.add() to upsert in place
+            # instead of duplicating rows on every ingestion run.
+            id=f"{document.id}-{index}",
             document_id=document.id,
             chunk_index=index,
             text=part,
