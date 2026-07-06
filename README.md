@@ -41,10 +41,12 @@ docmind/
 │   │   ├── embedding_service.py  # Text -> vector (Gemini embeddings)
 │   │   └── vector_store.py       # In-memory store + cosine similarity search
 │   ├── retrieval/
-│   │   ├── retriever.py          # Question -> relevant Chunks (dense/embedding, similarity threshold applied)
-│   │   ├── bm25_retriever.py     # Question -> relevant Chunks (keyword/BM25)
-│   │   ├── hybrid_retriever.py   # Merges dense + BM25 via Reciprocal Rank Fusion
-│   │   └── rag_service.py        # Question -> grounded answer + sources
+│   │   ├── retriever.py            # Question -> relevant Chunks (dense/embedding, similarity threshold applied)
+│   │   ├── bm25_retriever.py       # Question -> relevant Chunks (keyword/BM25)
+│   │   ├── hybrid_retriever.py     # Merges dense + BM25 via Reciprocal Rank Fusion
+│   │   ├── reranker.py             # Cross-encoder pairwise (question, chunk) scoring
+│   │   ├── reranking_retriever.py  # Wraps any retriever, reranks its candidates
+│   │   └── rag_service.py          # Question -> grounded answer + sources
 │   ├── storage/
 │   │   └── chroma_store.py       # Persistent, disk-backed vector store (same interface as in-memory)
 │   └── ui/
@@ -54,16 +56,19 @@ docmind/
 │   ├── test_search.py            # Manual test: ingest, then semantic search (in-memory)
 │   ├── test_rag.py               # Manual test: full RAG loop, in-memory store
 │   ├── test_hybrid.py            # Manual test: dense vs BM25 vs hybrid, side by side
+│   ├── test_rerank.py            # Manual test: hybrid vs hybrid+cross-encoder-reranked
 │   ├── ingest.py                 # Persist a PDF's embedded chunks into Chroma (run once per doc)
 │   └── ask.py                    # Ask a question against the persisted Chroma store (no re-embedding)
 ├── tests/
-│   ├── test_chunker.py           # Unit tests: chunking + overlap math
-│   ├── test_embeddings.py        # Unit tests: EmbeddingService (Gemini API mocked)
-│   ├── test_vector_store.py      # Unit tests: cosine similarity, ranking, top_k
-│   ├── test_chroma_store.py      # Integration tests: ChromaVectorStore (real, on-disk, no mocks)
-│   ├── test_retriever.py         # Unit tests: Retriever wiring + similarity threshold
-│   ├── test_bm25_retriever.py    # Unit tests: keyword matching, zero-overlap filtering
-│   └── test_hybrid_retriever.py  # Unit tests: Reciprocal Rank Fusion, fallback to BM25
+│   ├── test_chunker.py               # Unit tests: chunking + overlap math
+│   ├── test_embeddings.py            # Unit tests: EmbeddingService (Gemini API mocked)
+│   ├── test_vector_store.py          # Unit tests: cosine similarity, ranking, top_k
+│   ├── test_chroma_store.py          # Integration tests: ChromaVectorStore (real, on-disk, no mocks)
+│   ├── test_retriever.py             # Unit tests: Retriever wiring + similarity threshold
+│   ├── test_bm25_retriever.py        # Unit tests: keyword matching, zero-overlap filtering
+│   ├── test_hybrid_retriever.py      # Unit tests: Reciprocal Rank Fusion, fallback to BM25
+│   ├── test_reranker.py              # Unit tests: CrossEncoderReranker (model mocked)
+│   └── test_reranking_retriever.py   # Unit tests: RerankingRetriever wiring (deps mocked)
 ├── docs/
 │   ├── architecture.md           # Component diagram, index-time vs query-time flow
 │   └── ingestion.md              # PDF -> chunk -> embedding pipeline, in depth
@@ -86,6 +91,7 @@ Each folder has exactly one job. This mirrors a pattern you'd recognize from mob
 python -m venv .venv
 source .venv/bin/activate
 pip install google-genai python-dotenv rich pymupdf chromadb rank-bm25
+pip install sentence-transformers   # optional, only needed for reranking (see below) -- pulls in torch, a large download
 ```
 
 Create a `.env` file in the project root:
@@ -135,6 +141,12 @@ python scripts/ask.py "your question here"               # run any time after
 
 ```bash
 python scripts/test_hybrid.py data/documents/your_file.pdf "your question here"
+```
+
+**Compare hybrid retrieval before and after cross-encoder reranking (requires `sentence-transformers`):**
+
+```bash
+python scripts/test_rerank.py data/documents/your_file.pdf "your question here"
 ```
 
 ---
@@ -468,30 +480,61 @@ This is deliberately built on top of `Retriever.retrieve()` and `BM25Retriever.r
 
 ---
 
+## Part 6 — Cross-encoder reranking (`app/retrieval/reranker.py`, `reranking_retriever.py`)
+
+Hybrid retrieval (Part 5) improves *which* chunks make it into the candidate set, but nothing about dense search, BM25, or RRF actually reads a question and a chunk together and judges "does this specific pairing answer that specific question." A cross-encoder does exactly that:
+
+```
+Top ~20 candidates (from hybrid retrieval)
+                │
+                ▼
+   Cross-encoder scores each (question, chunk) pair directly
+                │
+                ▼
+        Best 5, re-ordered by that score
+                │
+                ▼
+               LLM
+```
+
+### Why this is a different kind of model, not just a better one
+
+Dense search and BM25 both work by computing a representation of the question and a representation of each chunk *independently*, then comparing those two fixed representations (cosine similarity for embeddings; term-frequency statistics for BM25). That independence is exactly what makes them fast — a chunk's embedding or BM25 statistics can be computed once and reused for every future query, which is why they can scale to searching an entire corpus.
+
+A cross-encoder gives up that independence on purpose: it feeds the question and a single candidate chunk into the model *together*, in one forward pass, and the model directly predicts how relevant that specific pairing is — closer to actually reading both texts side by side than comparing two points in space. That tends to be meaningfully more accurate, but there's no way to precompute anything, since the score only exists for a specific (question, chunk) pair. That's precisely why it's used to re-score a modest ~20-candidate shortlist from hybrid retrieval rather than the whole corpus — precision on a shortlist, not search over everything.
+
+### The code
+
+`app/retrieval/reranker.py`'s `CrossEncoderReranker.rerank(question, chunks, top_k)` scores every `(question, chunk.text)` pair with a `sentence-transformers` `CrossEncoder` model (`cross-encoder/ms-marco-MiniLM-L-6-v2` by default — a small, fast model trained specifically for passage reranking) and returns the top-k chunks by that score, discarding the base retriever's original order entirely.
+
+`app/retrieval/reranking_retriever.py`'s `RerankingRetriever` wraps *any* retriever — a plain `Retriever`, a `HybridRetriever`, whatever exposes `retrieve(question, top_k)` — pulls a wider candidate pool (`config.RERANK_CANDIDATE_POOL`, default 20) from it, and hands those candidates to the reranker:
+
+```python
+RagService(RerankingRetriever(HybridRetriever(dense, bm25)))
+```
+
+Crucially, reranking doesn't add its own relevance gate — it only re-orders whatever the base retriever already decided was plausible. If the base retriever (dense threshold, BM25 zero-overlap filter, or their hybrid combination) finds nothing, `RerankingRetriever` returns `[]` without ever touching the cross-encoder, so the "I don't know" guarantee from Parts 4-5 still holds all the way through reranking.
+
+### A dependency worth knowing about: lazy-loaded on purpose
+
+`sentence-transformers` pulls in `torch`, by far the heaviest dependency in this project (hundreds of MB). Importing `app.retrieval.reranker` does **not** require `torch` or `sentence-transformers` to be installed — the `from sentence_transformers import CrossEncoder` import is deferred inside `_get_model()`, which only runs the first time `.rerank()` is actually called, and the loaded model is cached at module level afterward so it only loads once per process, not once per call. This is why `tests/test_reranker.py` and `tests/test_reranking_retriever.py` can run (and did, as part of the 43-test suite) without the real dependency installed at all — they mock `_get_model()` directly. Only `scripts/test_rerank.py`, which needs the real model, requires `pip install sentence-transformers` first.
+
+`scripts/test_rerank.py` runs hybrid retrieval both before and after reranking for the same question, so the reordering is visible rather than theoretical — this comparison (hybrid alone vs. hybrid + reranked) is exactly what the next phase's evaluation harness is meant to turn into an actual number.
+
+---
+
 ## What's next
 
-Per the roadmap this project is following, Version 1 (chat, ingestion, chunking, embeddings, semantic search, retrieval, RAG service, citations, "I don't know" fallback) is functionally complete, and Week 1-2 of the retrieval-quality roadmap (similarity threshold, persistence, hybrid search) is now done too. What's left is:
+Per the guide this project follows, DocMind (Project 1) is now through Stage 5 of 7: LLM API foundations, ingestion/chunking, embeddings + vector DB, hybrid retrieval + reranking, and grounded generation with citations are all built. What's left:
 
-```
-Current (done)                        Next
+**Stage 6 — the evaluation harness.** Explicitly "the hero feature" of the whole project: a golden dataset of roughly 50 question/answer pairs against your own documents, and a script that runs the full pipeline against every question and measures two things — retrieval quality (did it fetch the right chunks?) and faithfulness (did the answer actually stick to the retrieved context, or hallucinate?). The entire point of building the eval harness now, rather than earlier, is to run it against the retrieval pipeline in two configurations — hybrid alone, and hybrid + reranked — and produce the headline number: "retrieval relevance went from X to Y after adding reranking." That's the interview-ready line this whole project has been building toward, and it only means something because both configurations already exist to compare (Parts 5 and 6, above).
 
-Dense + BM25 (RRF-fused)               Dense + BM25 (RRF-fused)
-      │                                      │
-      ▼                                      ▼
-     LLM                            Cross-Encoder Reranker
-                                             │
-                                             ▼
-                                            LLM
-```
+**Stage 7 — serving it.** A FastAPI service (`/upload`, `/query` endpoints), Docker packaging, and per-query cost/latency logging (tokens in/out, dollars per query) — turning DocMind from a library plus test scripts into an actual running service, which is also the shape `TaskAgent` (a separate, tool-using-agent project) expects to call as one of its tools.
 
-A cross-encoder reranker is a different kind of model from the embedding model used so far: instead of encoding the question and each chunk *separately* into vectors and comparing them (what both dense search and, in spirit, BM25 do), a cross-encoder reads the question and a candidate chunk *together* in a single pass and directly predicts a relevance score. That's slower per-pair (you can't precompute anything, unlike embeddings), which is exactly why it's used to re-score a modest top-20-or-so candidate set from hybrid retrieval rather than the entire corpus — precision over the shortlist, not search over everything.
-
-Concretely, still open: a cross-encoder reranker over hybrid retrieval's output, richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3", an evaluation harness (RAGAS/DeepEval or a hand-built `evaluation/dataset.json` of question → expected-answer pairs) to measure retrieval and answer quality objectively rather than by eyeballing outputs, wiring `RagService`/`HybridRetriever` into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts, applying the existing `SYSTEM_PROMPT` to the chat session, and eventually a FastAPI service + Docker packaging.
-
-Done, as of this update: the similarity threshold (Part 4) — the highest-priority item on the retrieval-quality list, since a retriever that can say "I don't know" is the foundation everything else builds on; swapping `InMemoryVectorStore` for a persistent `ChromaVectorStore` (Part 4), so embeddings survive a restart instead of being recomputed every run; and hybrid retrieval (Part 5) combining dense and keyword search via Reciprocal Rank Fusion.
+Smaller open items along the way: richer chunk metadata (page number, section) so citations can eventually say "Page 5" instead of "Chunk 3"; wiring `RagService`/the retrieval stack into the interactive `main.py` chat loop so it's one application instead of a library plus test scripts; applying the existing `SYSTEM_PROMPT` to the chat session; and optionally swapping `ChromaVectorStore` for `pgvector` later, to learn a production-grade Postgres-backed store once Chroma's local-first approach has served its purpose.
 
 ---
 
 ## Concepts this project demonstrates
 
-For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, a similarity threshold as the mechanism that lets a retriever say "I don't know" instead of always returning its best-available guess, designing an interface (`add`/`search`/`search_with_scores`) so a storage backend can be swapped from an in-memory list to a persistent database without touching any calling code, deterministic ID generation as a prerequisite for idempotent upserts, dense vs. keyword (BM25) search as complementary rather than competing signals, Reciprocal Rank Fusion as a way to merge rankings from incomparable scoring scales without normalizing either one, and a layered architecture (client / service / model / retrieval / storage / UI) that keeps each concern independently testable and replaceable.
+For anyone skimming this as a portfolio piece or before an interview, the ideas exercised here are: streaming API responses via generators/iterators, stateless-vs-stateful API design (why chat history has to be managed explicitly, and why a RAG call intentionally opts back out of it), the extract → chunk → embed → index → retrieve pipeline that underlies every production RAG system, cosine similarity and vector search implemented from first principles, prompt engineering to force grounding and a verbatim refusal message, deterministic citation attachment as a way to avoid trusting model self-reporting, a similarity threshold as the mechanism that lets a retriever say "I don't know" instead of always returning its best-available guess, designing an interface (`add`/`search`/`search_with_scores`) so a storage backend can be swapped from an in-memory list to a persistent database without touching any calling code, deterministic ID generation as a prerequisite for idempotent upserts, dense vs. keyword (BM25) search as complementary rather than competing signals, Reciprocal Rank Fusion as a way to merge rankings from incomparable scoring scales without normalizing either one, bi-encoder vs. cross-encoder architectures as a precompute-vs-precision trade-off, lazy imports as a way to keep a heavy optional dependency from leaking into every other module's testability, and a layered architecture (client / service / model / retrieval / storage / UI) that keeps each concern independently testable and replaceable.

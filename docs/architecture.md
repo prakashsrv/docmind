@@ -49,7 +49,7 @@ Plain-text version, for anywhere Mermaid isn't rendered:
 
 Note that `complete()` is a plain function in `chat_service.py`, not a method on the `ChatService` class used by the interactive terminal chat (`main.py`). They deliberately don't share state: `ChatService` keeps a running multi-turn conversation via `client.chats.create(...)`, while `complete()` is a one-shot, stateless call — a RAG prompt already carries its full context on every call, so it shouldn't also accumulate into a growing chat history.
 
-"Retriever" in the diagram above is really "whatever `RagService` was constructed with that implements `retrieve(question, top_k) -> list[Chunk]`" — that's a plain `Retriever` (dense/embedding search only) or a `HybridRetriever` (dense + BM25 fused), interchangeably. See below for how the latter works internally.
+"Retriever" in the diagram above is really "whatever `RagService` was constructed with that implements `retrieve(question, top_k) -> list[Chunk]`" — a plain `Retriever` (dense only), a `HybridRetriever` (dense + BM25), or a `RerankingRetriever` wrapping either of those, all interchangeably. See below for how each works internally.
 
 ## Hybrid retrieval: inside `HybridRetriever`
 
@@ -71,6 +71,28 @@ flowchart TD
 Both branches run independently and each applies its own relevance gate before fusion ever sees the candidates: `Retriever` drops anything below `SIMILARITY_THRESHOLD`, `BM25Retriever` drops anything with zero term overlap. Reciprocal Rank Fusion then merges the two (already-filtered) ranked lists by rank position, not raw score, since cosine similarity (0-1) and BM25 (unbounded, corpus-dependent) aren't on comparable scales. If both branches come back empty, `HybridRetriever` returns `[]` too — the "I don't know" guarantee from the similarity-threshold section holds for hybrid retrieval as well, it just now requires *both* signals to be silent rather than one.
 
 This is also precisely the scenario hybrid retrieval was built for: a query like an exact library name might clear BM25's zero-overlap filter easily while failing dense search's similarity threshold (embeddings represent overall meaning, not exact strings) — in that case `Dense` contributes nothing, `BM25` contributes the match, and the fused result surfaces it anyway. `tests/test_hybrid_retriever.py::test_hybrid_retriever_falls_back_to_bm25_when_dense_finds_nothing` tests exactly this.
+
+## Reranking: inside `RerankingRetriever`
+
+```mermaid
+flowchart TD
+    Question([Question])
+    Base["base_retriever.retrieve()<br/>(Retriever or HybridRetriever, top ~20)"]
+    Reranker["CrossEncoderReranker.rerank()<br/>(scores each (question, chunk) pair together)"]
+    Result([Best top_k, reordered by cross-encoder score])
+
+    Question --> Base
+    Base --> Reranker
+    Reranker --> Result
+```
+
+`RerankingRetriever` wraps *any* other retriever (`base_retriever` is duck-typed — it just needs a `retrieve(question, top_k)` method) and adds one more pass: pull a wider candidate pool (`config.RERANK_CANDIDATE_POOL`, 20 by default) from the base retriever, then let a cross-encoder model score each `(question, chunk)` pair directly and keep the top `top_k` by that score.
+
+The key architectural point: `RerankingRetriever` adds no relevance gate of its own. Whatever the base retriever already decided was plausible (dense's similarity threshold, BM25's zero-overlap filter, or hybrid's union of both) is the only thing that ever reaches the reranker; if the base retriever returns `[]`, `RerankingRetriever` returns `[]` immediately without invoking the cross-encoder at all. Reranking only ever re-*orders* candidates, it never independently decides whether the corpus contains anything relevant — the "I don't know" guarantee flows through unchanged from whichever retriever it's wrapping.
+
+**Why this needs a different model, not just a better embedding.** Dense search and BM25 both compute a representation of the question and a representation of each chunk *independently* — that's what makes them fast, since a chunk's representation can be computed once (at ingestion time) and reused for every future query. A cross-encoder gives up that independence: it feeds the question and one candidate chunk into the model together and predicts a relevance score for that specific pair, which is typically more accurate but impossible to precompute — there's no such thing as "chunk 5's cross-encoder score" independent of some specific question. That's the entire reason it's used to re-score a ~20-item shortlist instead of the whole corpus.
+
+**A dependency worth being deliberate about.** `sentence-transformers` (and the `torch` it depends on) is the heaviest dependency in this project by a wide margin. `app/retrieval/reranker.py` defers the `from sentence_transformers import CrossEncoder` import to inside `_get_model()`, which only runs on the first actual `rerank()` call — so importing `reranker.py` or `reranking_retriever.py` doesn't require the dependency to be installed, and neither do their tests (`tests/test_reranker.py`, `tests/test_reranking_retriever.py`), which mock `_get_model()` directly rather than loading a real model.
 
 ## Index-time flow: ingesting a document
 
@@ -139,7 +161,8 @@ Before this, vector search always returned *something* — the top-k least-bad m
 ## Current limitations (see `README.md` → "What's next")
 
 - The flows above aren't connected to `main.py`'s interactive chat loop yet — there's no single running application, only test scripts / `ingest.py` + `ask.py` that exercise the full pipeline.
-- No reranking yet: hybrid retrieval (dense + BM25, RRF-fused) improves the candidate set, but nothing re-scores question+chunk pairs together the way a cross-encoder would — see README's "What's next" for what that adds.
+- No evaluation harness yet: there's no golden dataset or automated way to measure retrieval/faithfulness quality, so every claim about hybrid search or reranking "improving" results so far is qualitative (a specific example query), not a measured number. That's the explicit next step.
 - `BM25Retriever` rebuilds its keyword index from scratch on construction (`BM25Okapi([...])` over the whole corpus) — fine for the corpus sizes here, but unlike `ChromaVectorStore` it has no persistence of its own yet.
 - The similarity threshold is a single global constant, not calibrated against real usage data — see the section above.
 - `ChromaVectorStore.search()` doesn't return the chunk's embedding vector (Chroma isn't asked for it back, since nothing downstream needs it) — a real difference from `InMemoryVectorStore`, which happens to return the original in-memory object with its embedding intact. Don't rely on `chunk.embedding` being populated after any search.
+- The cross-encoder model (`RERANKER_MODEL_NAME`) and its `RERANK_CANDIDATE_POOL` size are defaults from the guide this project follows, not values validated against this project's actual documents — same caveat as the similarity threshold.
