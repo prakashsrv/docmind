@@ -437,6 +437,17 @@ fused_score(chunk) = sum over each list it appears in of 1 / (k + rank)
 
 A chunk ranked #1 by both dense and BM25 search clearly deserves to outrank one ranked #1 by only one of them — and that reasoning holds regardless of what scale either method's underlying scores are on. `k=60` is the standard smoothing constant from the original RRF paper, not something tuned for this project specifically.
 
+**Worked example.** Say dense search and BM25 each rank the same 4 chunks differently:
+
+| Chunk | Dense rank | BM25 rank | Fused score = 1/(60+dense) + 1/(60+bm25) |
+|---|---|---|---|
+| A | 1 | 3 | 1/61 + 1/63 = 0.0323 |
+| B | 2 | 1 | 1/62 + 1/61 = 0.0325 |
+| C | 4 | 2 | 1/64 + 1/62 = 0.0318 |
+| D | 5 | 10 | 1/65 + 1/70 = 0.0297 |
+
+Final fused order: **B → A → C → D.** B edges out A despite ranking one position lower in dense search, because it ranks higher in BM25 (#1 vs #3) — RRF rewards a chunk that both methods agree is good over one only a single method loves, even if that one method ranks it #1. (If you've seen this example elsewhere with the order listed as A → B → C → D, double-check the arithmetic — with `k=60` these exact rank pairs put B slightly ahead of A.)
+
 ### `HybridRetriever`: each side contributes only what it's confident about
 
 ```python
